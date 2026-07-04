@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
-import { embedImages, getImageEmbedder, getResolvedDevice, type Device } from './clip.ts'
+import { embedImages, getImageEmbedder, getResolvedDevice, type Device, type EmbeddedImage } from './clip.ts'
 import { projectTo2D } from './layout.ts'
 import { assignGrid } from './grid.ts'
 import { ImageMap, type ImageMapItem } from './ImageMap.tsx'
+import { mulberry32, randomSeed } from './random.ts'
 
 const IMAGE_TYPE_RE = /^image\//
 const IGNORED_EXTENSION_RE = /\.arw$/i
@@ -13,12 +14,27 @@ type MapState = {
   rows: number
 }
 
+type LayoutSettings = {
+  nNeighbors: number
+  minDist: number
+  nEpochs: number
+  seed: number
+}
+
+const DEFAULT_SETTINGS: Omit<LayoutSettings, 'seed'> = {
+  nNeighbors: 30,
+  minDist: 0.25,
+  nEpochs: 500,
+}
+
 export function App() {
   const [status, setStatus] = useState('Loading CLIP model…')
   const [ready, setReady] = useState(false)
   const [working, setWorking] = useState(false)
   const [mapState, setMapState] = useState<MapState | null>(null)
   const [device, setDevice] = useState<Device | null>(null)
+  const [embedded, setEmbedded] = useState<EmbeddedImage[]>([])
+  const [settings, setSettings] = useState<LayoutSettings>(() => ({ ...DEFAULT_SETTINGS, seed: randomSeed() }))
   const folderInputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
@@ -33,6 +49,42 @@ export function App() {
     folderInputRef.current?.setAttribute('webkitdirectory', '')
   }, [])
 
+  /** Re-projects already-embedded images into the grid using `layoutSettings`. */
+  async function runLayout(images: EmbeddedImage[], layoutSettings: LayoutSettings) {
+    setWorking(true)
+    setStatus(`Projecting ${images.length} embeddings…`)
+
+    // UMAP → 2D
+    const points = await projectTo2D(
+      images.map((e) => e.embedding),
+      (epoch, total) => setStatus(`Projecting — epoch ${epoch}/${total}…`),
+      {
+        nNeighbors: layoutSettings.nNeighbors,
+        minDist: layoutSettings.minDist,
+        nEpochs: layoutSettings.nEpochs,
+        random: mulberry32(layoutSettings.seed),
+      },
+    )
+
+    setStatus(`Arranging grid…`)
+
+    // Grid assignment
+    const aspect = window.innerWidth / window.innerHeight
+    const { cells, cols, rows } = assignGrid(points, aspect)
+
+    const items: ImageMapItem[] = cells.map((cell) => ({
+      index: cell.index,
+      name: images[cell.index].name,
+      file: images[cell.index].file,
+      col: cell.col,
+      row: cell.row,
+    }))
+
+    setMapState({ items, cols, rows })
+    setStatus(`${images.length} images`)
+    setWorking(false)
+  }
+
   async function handleFolderChange(event: React.ChangeEvent<HTMLInputElement>) {
     const files = Array.from(event.target.files ?? []).filter(
       (file) => IMAGE_TYPE_RE.test(file.type) && !IGNORED_EXTENSION_RE.test(file.name),
@@ -45,48 +97,39 @@ export function App() {
     setWorking(true)
     setMapState(null)
 
-    // 1. Embed
     let cachedCount = 0
-    const embedded = await embedImages(files, (done, total, name, fromCache) => {
+    const images = await embedImages(files, (done, total, name, fromCache) => {
       if (fromCache) cachedCount++
       const cacheNote = cachedCount > 0 ? ` (${cachedCount} cached)` : ''
       setStatus(`Embedding ${done}/${total}${cacheNote}${name ? ` — ${name}` : ''}`)
     })
 
-    if (embedded.length === 0) {
+    if (images.length === 0) {
       setStatus('No images could be embedded')
       setWorking(false)
       return
     }
 
-    setStatus(`Projecting ${embedded.length} embeddings…`)
+    setEmbedded(images)
+    await runLayout(images, settings)
+  }
 
-    // 2. UMAP → 2D
-    const points = await projectTo2D(
-      embedded.map((e) => e.embedding),
-      (epoch) => setStatus(`Projecting — epoch ${epoch}…`),
-    )
+  function handleSettingChange(patch: Partial<Omit<LayoutSettings, 'seed'>>) {
+    setSettings((prev) => ({ ...prev, ...patch }))
+  }
 
-    setStatus(`Arranging grid…`)
+  function handleApplySettings() {
+    if (embedded.length > 0) void runLayout(embedded, settings)
+  }
 
-    // 3. Grid assignment
-    const aspect = window.innerWidth / window.innerHeight
-    const { cells, cols, rows } = assignGrid(points, aspect)
-
-    const items: ImageMapItem[] = cells.map((cell) => ({
-      index: cell.index,
-      name: embedded[cell.index].name,
-      file: embedded[cell.index].file,
-      col: cell.col,
-      row: cell.row,
-    }))
-
-    setMapState({ items, cols, rows })
-    setStatus(`${embedded.length} images — scroll to zoom, drag to pan`)
-    setWorking(false)
+  function handleRandomizeSeed() {
+    const next = { ...settings, seed: randomSeed() }
+    setSettings(next)
+    if (embedded.length > 0) void runLayout(embedded, next)
   }
 
   const showMap = mapState !== null
+  const hasEmbeddings = embedded.length > 0
 
   return (
     <>
@@ -105,6 +148,64 @@ export function App() {
           disabled={!ready || working}
           onChange={handleFolderChange}
         />
+
+        {ready && (
+          <div className="settings">
+            <label className="settings__row">
+              <span>Neighbors</span>
+              <input
+                type="range"
+                min={2}
+                max={100}
+                step={1}
+                value={settings.nNeighbors}
+                disabled={working}
+                onChange={(e) => handleSettingChange({ nNeighbors: Number(e.target.value) })}
+              />
+              <span className="settings__value">{settings.nNeighbors}</span>
+            </label>
+
+            <label className="settings__row">
+              <span>Min dist</span>
+              <input
+                type="range"
+                min={0}
+                max={0.99}
+                step={0.01}
+                value={settings.minDist}
+                disabled={working}
+                onChange={(e) => handleSettingChange({ minDist: Number(e.target.value) })}
+              />
+              <span className="settings__value">{settings.minDist.toFixed(2)}</span>
+            </label>
+
+            <label className="settings__row">
+              <span>Epochs</span>
+              <input
+                type="range"
+                min={50}
+                max={1000}
+                step={10}
+                value={settings.nEpochs}
+                disabled={working}
+                onChange={(e) => handleSettingChange({ nEpochs: Number(e.target.value) })}
+              />
+              <span className="settings__value">{settings.nEpochs}</span>
+            </label>
+
+            <div className="settings__actions">
+              <button type="button" disabled={!hasEmbeddings || working} onClick={handleApplySettings}>
+                Apply
+              </button>
+              <button type="button" disabled={!hasEmbeddings || working} onClick={handleRandomizeSeed}>
+                🎲 Randomize seed
+              </button>
+              <span className="settings__seed" title="Current UMAP seed">
+                seed {settings.seed}
+              </span>
+            </div>
+          </div>
+        )}
       </header>
 
       {showMap && (

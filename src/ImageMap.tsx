@@ -21,6 +21,14 @@ const LABEL_FONT = '11px system-ui, sans-serif'
 const MIN_SCALE = 0.05
 const MAX_SCALE = 8
 
+// Decoding thousands of images at once (e.g. right after "fit to view" reveals
+// the whole grid) can exceed the browser's concurrent-decode/memory budget and
+// cause createImageBitmap to reject for a chunk of them. Cap concurrency and
+// retry transient failures instead of giving up on the first rejection.
+const MAX_CONCURRENT_DECODES = 12
+const MAX_DECODE_RETRIES = 3
+const DECODE_RETRY_BASE_MS = 300
+
 export function ImageMap({ items, cols, rows }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
 
@@ -29,6 +37,11 @@ export function ImageMap({ items, cols, rows }: Props) {
 
   // Bitmap cache: index -> ImageBitmap | 'loading' | 'error'
   const bitmapCache = useRef<Map<number, ImageBitmap | 'loading' | 'error'>>(new Map())
+
+  // Decode queue + in-flight counter used to throttle concurrent createImageBitmap calls
+  const decodeQueueRef = useRef<ImageMapItem[]>([])
+  const inFlightRef = useRef(0)
+  const retryCountRef = useRef<Map<number, number>>(new Map())
 
   // Tooltip state
   const tooltipRef = useRef<{ name: string; x: number; y: number } | null>(null)
@@ -39,6 +52,48 @@ export function ImageMap({ items, cols, rows }: Props) {
   const scheduleRedraw = useCallback(() => {
     dirty.current = true
   }, [])
+
+  // ── Decoding ───────────────────────────────────────────────────────────────
+
+  /**
+   * Pulls items off the decode queue up to MAX_CONCURRENT_DECODES in flight.
+   * On failure, retries with exponential backoff a few times before giving up
+   * and marking the cell as 'error' — this is what lets transient
+   * resource-exhaustion failures (rather than genuinely corrupt files) recover
+   * instead of permanently falling back to the placeholder.
+   */
+  const pumpDecodeQueue = useCallback(() => {
+    while (inFlightRef.current < MAX_CONCURRENT_DECODES && decodeQueueRef.current.length > 0) {
+      const item = decodeQueueRef.current.shift()!
+      inFlightRef.current++
+
+      createImageBitmap(item.file, { resizeWidth: CELL_PX, resizeHeight: CELL_PX, resizeQuality: 'medium' })
+        .then((bmp) => {
+          bitmapCache.current.set(item.index, bmp)
+          scheduleRedraw()
+        })
+        .catch((error) => {
+          const retries = retryCountRef.current.get(item.index) ?? 0
+          if (retries < MAX_DECODE_RETRIES) {
+            retryCountRef.current.set(item.index, retries + 1)
+            const delay = DECODE_RETRY_BASE_MS * 2 ** retries
+            console.warn(`Decode failed for "${item.name}", retrying (${retries + 1}/${MAX_DECODE_RETRIES})…`, error)
+            setTimeout(() => {
+              decodeQueueRef.current.push(item)
+              pumpDecodeQueue()
+            }, delay)
+          } else {
+            console.error(`Giving up decoding "${item.name}" after ${MAX_DECODE_RETRIES} retries:`, error)
+            bitmapCache.current.set(item.index, 'error')
+            scheduleRedraw()
+          }
+        })
+        .finally(() => {
+          inFlightRef.current--
+          pumpDecodeQueue()
+        })
+    }
+  }, [scheduleRedraw])
 
   // ── Drawing ────────────────────────────────────────────────────────────────
 
@@ -82,17 +137,10 @@ export function ImageMap({ items, cols, rows }: Props) {
         ctx.fillStyle = PLACEHOLDER_COLOR
         ctx.fillRect(wx, wy, CELL_PX, CELL_PX)
 
-        // Kick off decode if not already started
+        // Queue decode if not already started (throttled — see pumpDecodeQueue)
         if (!bitmapCache.current.has(item.index)) {
           bitmapCache.current.set(item.index, 'loading')
-          createImageBitmap(item.file, { resizeWidth: CELL_PX, resizeHeight: CELL_PX, resizeQuality: 'medium' })
-            .then((bmp) => {
-              bitmapCache.current.set(item.index, bmp)
-              scheduleRedraw()
-            })
-            .catch(() => {
-              bitmapCache.current.set(item.index, 'error')
-            })
+          decodeQueueRef.current.push(item)
         }
 
         if (bmp === 'error') {
@@ -101,6 +149,8 @@ export function ImageMap({ items, cols, rows }: Props) {
         }
       }
     }
+
+    pumpDecodeQueue()
 
     ctx.restore()
 
@@ -121,7 +171,7 @@ export function ImageMap({ items, cols, rows }: Props) {
       ctx.fillText(tip.name, tx + 6, ty + 14)
       ctx.restore()
     }
-  }, [items, scheduleRedraw])
+  }, [items, scheduleRedraw, pumpDecodeQueue])
 
   // ── RAF loop ───────────────────────────────────────────────────────────────
 
@@ -252,6 +302,8 @@ export function ImageMap({ items, cols, rows }: Props) {
         if (v !== 'loading' && v !== 'error') v.close()
       }
       bitmapCache.current.clear()
+      decodeQueueRef.current = []
+      retryCountRef.current.clear()
     }
   }, [items])
 

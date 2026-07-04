@@ -66,6 +66,70 @@ body,
   opacity: 0.9;
 }
 
+/* ── Settings ── */
+
+.settings {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(128, 128, 128, 0.3);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  pointer-events: auto;
+}
+
+.settings__row {
+  display: grid;
+  grid-template-columns: 64px 1fr 40px;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.78rem;
+  text-align: left;
+}
+
+.settings__row span:first-child {
+  opacity: 0.75;
+}
+
+.settings__value {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.9;
+}
+
+.settings__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.settings__actions button {
+  font-size: 0.78rem;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(128, 128, 128, 0.4);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.settings__actions button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.settings__actions button:not(:disabled):hover {
+  background: rgba(128, 128, 128, 0.2);
+}
+
+.settings__seed {
+  margin-left: auto;
+  font-size: 0.72rem;
+  opacity: 0.6;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ── Map ── */
 
 .map-container {

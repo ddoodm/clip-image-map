@@ -1,7 +1,7 @@
-import { pipeline, type ImageFeatureExtractionPipeline } from '@huggingface/transformers'
+import { AutoProcessor, SiglipVisionModel, RawImage } from '@huggingface/transformers'
 import { hashFile, getCachedEmbeddings, putEmbeddings } from './embeddingCache.ts'
 
-export const MODEL_ID = 'Xenova/clip-vit-base-patch32'
+export const MODEL_ID = 'onnx-community/siglip2-base-patch16-224-ONNX'
 
 export type Device = 'webgpu' | 'wasm'
 
@@ -26,44 +26,67 @@ async function detectDevice(): Promise<Device> {
   }
 }
 
-let extractorPromise: Promise<ImageFeatureExtractionPipeline> | null = null
-
-/** Lazily loads (and caches) the CLIP image encoder. */
-export function getImageEmbedder(onProgress?: (status: string) => void) {
-  if (!extractorPromise) {
-    extractorPromise = detectDevice().then(async (device) => {
-      try {
-        const embedder = await pipeline('image-feature-extraction', MODEL_ID, {
-          device,
-          dtype: device === 'webgpu' ? 'fp32' : 'q8',
-          progress_callback: (progress: any) => {
-            if (progress.status === 'progress') {
-              onProgress?.(`${progress.file} — ${Math.round(progress.progress)}%`)
-            } else {
-              onProgress?.(progress.status)
-            }
-          },
-        })
-        resolvedDevice = device
-        return embedder
-      } catch (error) {
-        if (device === 'wasm') throw error
-        console.error('WebGPU pipeline failed to load, falling back to WASM:', error)
-        resolvedDevice = 'wasm'
-        return pipeline('image-feature-extraction', MODEL_ID, { device: 'wasm', dtype: 'q8' })
-      }
-    })
-  }
-  return extractorPromise
+type Embedder = {
+  processor: Awaited<ReturnType<typeof AutoProcessor.from_pretrained>>
+  model: Awaited<ReturnType<typeof SiglipVisionModel.from_pretrained>>
 }
 
-/** Runs an image through CLIP and returns its embedding as a plain number array. */
+let embedderPromise: Promise<Embedder> | null = null
+
+/**
+ * Lazily loads (and caches) the SigLIP2 vision encoder and its image
+ * processor. `SiglipVisionModel.from_pretrained` fetches only the
+ * `vision_model*.onnx` weights (not the text tower), so this stays a
+ * single-purpose image encoder despite SigLIP2 being a dual-encoder model.
+ */
+export function getImageEmbedder(onProgress?: (status: string) => void): Promise<Embedder> {
+  if (!embedderPromise) {
+    embedderPromise = (async () => {
+      const processor = await AutoProcessor.from_pretrained(MODEL_ID)
+      const device = await detectDevice()
+
+      const progress_callback = (progress: any) => {
+        if (progress.status === 'progress') {
+          onProgress?.(`${progress.file} — ${Math.round(progress.progress)}%`)
+        } else {
+          onProgress?.(progress.status)
+        }
+      }
+
+      try {
+        const model = await SiglipVisionModel.from_pretrained(MODEL_ID, {
+          device,
+          dtype: device === 'webgpu' ? 'fp32' : 'q8',
+          progress_callback,
+        })
+        resolvedDevice = device
+        return { processor, model }
+      } catch (error) {
+        if (device === 'wasm') throw error
+        console.error('WebGPU model failed to load, falling back to WASM:', error)
+        resolvedDevice = 'wasm'
+        const model = await SiglipVisionModel.from_pretrained(MODEL_ID, { device: 'wasm', dtype: 'q8' })
+        return { processor, model }
+      }
+    })()
+  }
+  return embedderPromise
+}
+
+/** Runs a decoded image through the processor + vision encoder and returns its pooled embedding. */
+async function embedRawImage({ processor, model }: Embedder, image: RawImage): Promise<number[]> {
+  const inputs = await processor(image)
+  const { pooler_output } = await model(inputs)
+  return Array.from(pooler_output.data as Float32Array)
+}
+
+/** Runs an image through SigLIP2 and returns its embedding as a plain number array. */
 export async function embedImage(image: string | File, onProgress?: (status: string) => void) {
   const embedder = await getImageEmbedder(onProgress)
   const source = image instanceof File ? URL.createObjectURL(image) : image
   try {
-    const output = await embedder(source)
-    return Array.from(output.data as Float32Array)
+    const raw = await RawImage.read(source)
+    return await embedRawImage(embedder, raw)
   } finally {
     if (image instanceof File) URL.revokeObjectURL(source)
   }
@@ -115,8 +138,8 @@ export async function embedImages(
     onProgress?.(i, files.length, file.name, false)
     const source = URL.createObjectURL(file)
     try {
-      const output = await embedder!(source)
-      const embedding = Array.from(output.data as Float32Array)
+      const raw = await RawImage.read(source)
+      const embedding = await embedRawImage(embedder!, raw)
       results.push({ name: file.name, embedding, file })
       toStore.push({ id, embedding })
     } catch (error) {
