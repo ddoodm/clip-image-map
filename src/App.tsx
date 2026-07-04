@@ -46,8 +46,11 @@ export function App() {
     setMapState(null)
 
     // 1. Embed
-    const embedded = await embedImages(files, (done, total, name) => {
-      setStatus(`Embedding ${done}/${total}${name ? ` — ${name}` : ''}`)
+    let cachedCount = 0
+    const embedded = await embedImages(files, (done, total, name, fromCache) => {
+      if (fromCache) cachedCount++
+      const cacheNote = cachedCount > 0 ? ` (${cachedCount} cached)` : ''
+      setStatus(`Embedding ${done}/${total}${cacheNote}${name ? ` — ${name}` : ''}`)
     })
 
     if (embedded.length === 0) {

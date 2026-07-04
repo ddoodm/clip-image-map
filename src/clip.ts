@@ -1,6 +1,7 @@
 import { pipeline, type ImageFeatureExtractionPipeline } from '@huggingface/transformers'
+import { hashFile, getCachedEmbeddings, putEmbeddings } from './embeddingCache.ts'
 
-const MODEL_ID = 'Xenova/clip-vit-base-patch32'
+export const MODEL_ID = 'Xenova/clip-vit-base-patch32'
 
 export type Device = 'webgpu' | 'wasm'
 
@@ -78,21 +79,46 @@ export type EmbeddedImage = {
  * Embeds a batch of image files sequentially (the model runs on a single
  * WASM/WebGPU context, so parallelizing calls doesn't help and just spikes
  * memory). Files that fail to embed are skipped rather than aborting the batch.
+ *
+ * Files whose embeddings are already in the IndexedDB cache are returned
+ * immediately without running the model. The `onProgress` 4th arg signals
+ * whether the current item was served from cache.
  */
 export async function embedImages(
   files: File[],
-  onProgress?: (done: number, total: number, name: string) => void,
+  onProgress?: (done: number, total: number, name: string, fromCache: boolean) => void,
 ): Promise<EmbeddedImage[]> {
-  const embedder = await getImageEmbedder()
+  // Hash all files in parallel (cheap compared to inference).
+  const hashes = await Promise.all(files.map(hashFile))
+  const ids = hashes.map((h) => `${MODEL_ID}:${h}`)
+
+  const cached = await getCachedEmbeddings(ids)
+
+  // Only load the model if there are cache misses.
+  const hasMisses = ids.some((id) => !cached.has(id))
+  const embedder = hasMisses ? await getImageEmbedder() : null
+
   const results: EmbeddedImage[] = []
+  const toStore: { id: string; embedding: number[] }[] = []
 
   for (let i = 0; i < files.length; i++) {
     const file = files[i]
-    onProgress?.(i, files.length, file.name)
+    const id = ids[i]
+    const hit = cached.get(id)
+
+    if (hit) {
+      onProgress?.(i, files.length, file.name, true)
+      results.push({ name: file.name, embedding: hit, file })
+      continue
+    }
+
+    onProgress?.(i, files.length, file.name, false)
     const source = URL.createObjectURL(file)
     try {
-      const output = await embedder(source)
-      results.push({ name: file.name, embedding: Array.from(output.data as Float32Array), file })
+      const output = await embedder!(source)
+      const embedding = Array.from(output.data as Float32Array)
+      results.push({ name: file.name, embedding, file })
+      toStore.push({ id, embedding })
     } catch (error) {
       console.error(`Failed to embed ${file.name}:`, error)
     } finally {
@@ -100,6 +126,7 @@ export async function embedImages(
     }
   }
 
-  onProgress?.(files.length, files.length, '')
+  onProgress?.(files.length, files.length, '', false)
+  await putEmbeddings(toStore)
   return results
 }
