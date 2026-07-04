@@ -21,6 +21,16 @@ const LABEL_FONT = '11px system-ui, sans-serif'
 const MIN_SCALE = 0.05
 const MAX_SCALE = 8
 
+// Momentum tuning — kept subtle so the map still feels precise, with just a
+// touch of glide after a pan release or a burst of scrolling.
+const PAN_FRICTION = 0.9          // velocity retained per ~16.7ms frame
+const PAN_STOP_SPEED = 0.02       // device px/ms below which pan velocity snaps to 0
+const MAX_PAN_VELOCITY = 5        // device px/ms cap, to avoid huge flings on pointer jumps
+const ZOOM_FRICTION = 0.85        // log-scale velocity retained per ~16.7ms frame
+const ZOOM_STOP_SPEED = 0.00005   // log-scale units/ms below which zoom velocity snaps to 0
+const ZOOM_VELOCITY_GAIN = 0.5    // how much of each wheel tick feeds into momentum
+const MAX_ZOOM_VELOCITY = 0.005   // log-scale units/ms cap
+
 // Decoding thousands of images at once (e.g. right after "fit to view" reveals
 // the whole grid) can exceed the browser's concurrent-decode/memory budget and
 // cause createImageBitmap to reject for a chunk of them. Cap concurrency and
@@ -45,6 +55,11 @@ export function ImageMap({ items, cols, rows }: Props) {
 
   // Tooltip state
   const tooltipRef = useRef<{ name: string; x: number; y: number } | null>(null)
+
+  // Momentum state for pan (device px/ms) and zoom (log-scale units/ms, plus
+  // the screen point to zoom around while it eases out).
+  const panVelocityRef = useRef({ vx: 0, vy: 0 })
+  const zoomVelocityRef = useRef({ vLog: 0, px: 0, py: 0 })
 
   const rafRef = useRef<number>(0)
   const dirty = useRef(true)
@@ -94,6 +109,53 @@ export function ImageMap({ items, cols, rows }: Props) {
         })
     }
   }, [scheduleRedraw])
+
+  // ── Camera helpers ─────────────────────────────────────────────────────────
+
+  const applyZoomFactor = useCallback((factor: number, px: number, py: number) => {
+    const cam = camRef.current
+    const newScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, cam.scale * factor))
+    const ratio = newScale / cam.scale
+    cam.x = px - ratio * (px - cam.x)
+    cam.y = py - ratio * (py - cam.y)
+    cam.scale = newScale
+  }, [])
+
+  /**
+   * Advances pan/zoom momentum by dt milliseconds. Pan only glides while the
+   * pointer isn't actively dragging; zoom momentum always eases out, layering
+   * on top of whatever the user is doing with the wheel.
+   */
+  const stepMomentum = useCallback((dt: number) => {
+    let changed = false
+    const frameDecay = dt / 16.6667
+
+    if (!dragRef.current) {
+      const pv = panVelocityRef.current
+      if (Math.abs(pv.vx) > PAN_STOP_SPEED || Math.abs(pv.vy) > PAN_STOP_SPEED) {
+        camRef.current.x += pv.vx * dt
+        camRef.current.y += pv.vy * dt
+        const decay = Math.pow(PAN_FRICTION, frameDecay)
+        pv.vx *= decay
+        pv.vy *= decay
+        changed = true
+      } else if (pv.vx !== 0 || pv.vy !== 0) {
+        pv.vx = 0
+        pv.vy = 0
+      }
+    }
+
+    const zv = zoomVelocityRef.current
+    if (Math.abs(zv.vLog) > ZOOM_STOP_SPEED) {
+      applyZoomFactor(Math.exp(zv.vLog * dt), zv.px, zv.py)
+      zv.vLog *= Math.pow(ZOOM_FRICTION, frameDecay)
+      changed = true
+    } else if (zv.vLog !== 0) {
+      zv.vLog = 0
+    }
+
+    if (changed) scheduleRedraw()
+  }, [applyZoomFactor, scheduleRedraw])
 
   // ── Drawing ────────────────────────────────────────────────────────────────
 
@@ -177,8 +239,13 @@ export function ImageMap({ items, cols, rows }: Props) {
 
   useEffect(() => {
     let running = true
-    function loop() {
+    let lastT: number | null = null
+    function loop(t: number) {
       if (!running) return
+      // Clamp dt so returning from a backgrounded tab doesn't produce one huge jump.
+      const dt = lastT === null ? 16.6667 : Math.min(64, t - lastT)
+      lastT = t
+      stepMomentum(dt)
       draw()
       rafRef.current = requestAnimationFrame(loop)
     }
@@ -187,7 +254,7 @@ export function ImageMap({ items, cols, rows }: Props) {
       running = false
       cancelAnimationFrame(rafRef.current)
     }
-  }, [draw])
+  }, [draw, stepMomentum])
 
   // ── Resize observer ────────────────────────────────────────────────────────
 
@@ -223,6 +290,7 @@ export function ImageMap({ items, cols, rows }: Props) {
   // ── Pointer events ─────────────────────────────────────────────────────────
 
   const dragRef = useRef<{ startX: number; startY: number; camX: number; camY: number } | null>(null)
+  const lastMoveRef = useRef<{ x: number; y: number; t: number } | null>(null)
 
   const onPointerDown = useCallback((e: React.PointerEvent) => {
     if (e.button !== 0) return
@@ -233,6 +301,8 @@ export function ImageMap({ items, cols, rows }: Props) {
       camX: camRef.current.x,
       camY: camRef.current.y,
     }
+    panVelocityRef.current = { vx: 0, vy: 0 }
+    lastMoveRef.current = { x: e.clientX * devicePixelRatio, y: e.clientY * devicePixelRatio, t: performance.now() }
   }, [])
 
   const onPointerMove = useCallback((e: React.PointerEvent) => {
@@ -241,6 +311,22 @@ export function ImageMap({ items, cols, rows }: Props) {
       const dy = (e.clientY - dragRef.current.startY) * devicePixelRatio
       camRef.current.x = dragRef.current.camX + dx
       camRef.current.y = dragRef.current.camY + dy
+
+      // Track a smoothed release velocity so lifting the pointer glides on
+      // instead of stopping dead.
+      const now = performance.now()
+      const last = lastMoveRef.current
+      if (last) {
+        const dt = Math.max(1, now - last.t)
+        const px = e.clientX * devicePixelRatio
+        const py = e.clientY * devicePixelRatio
+        const rawVx = Math.max(-MAX_PAN_VELOCITY, Math.min(MAX_PAN_VELOCITY, (px - last.x) / dt))
+        const rawVy = Math.max(-MAX_PAN_VELOCITY, Math.min(MAX_PAN_VELOCITY, (py - last.y) / dt))
+        panVelocityRef.current.vx = panVelocityRef.current.vx * 0.6 + rawVx * 0.4
+        panVelocityRef.current.vy = panVelocityRef.current.vy * 0.6 + rawVy * 0.4
+        lastMoveRef.current = { x: px, y: py, t: now }
+      }
+
       scheduleRedraw()
       tooltipRef.current = null
       return
@@ -274,7 +360,9 @@ export function ImageMap({ items, cols, rows }: Props) {
   }, [items, scheduleRedraw])
 
   const onPointerUp = useCallback(() => {
+    // Leave panVelocityRef as-is so the momentum step can glide it to a stop.
     dragRef.current = null
+    lastMoveRef.current = null
   }, [])
 
   const onWheel = useCallback((e: React.WheelEvent) => {
@@ -285,14 +373,17 @@ export function ImageMap({ items, cols, rows }: Props) {
     const px = (e.clientX - rect.left) * devicePixelRatio
     const py = (e.clientY - rect.top) * devicePixelRatio
     const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1
-    const cam = camRef.current
-    const newScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, cam.scale * factor))
-    const ratio = newScale / cam.scale
-    cam.x = px - ratio * (px - cam.x)
-    cam.y = py - ratio * (py - cam.y)
-    cam.scale = newScale
+    applyZoomFactor(factor, px, py)
+
+    // Build up a touch of zoom momentum so scrolling eases out rather than stopping dead.
+    const zv = zoomVelocityRef.current
+    const combined = zv.vLog + Math.log(factor) * ZOOM_VELOCITY_GAIN
+    zv.vLog = Math.max(-MAX_ZOOM_VELOCITY, Math.min(MAX_ZOOM_VELOCITY, combined))
+    zv.px = px
+    zv.py = py
+
     scheduleRedraw()
-  }, [scheduleRedraw])
+  }, [applyZoomFactor, scheduleRedraw])
 
   // ── Cleanup bitmaps ────────────────────────────────────────────────────────
 
